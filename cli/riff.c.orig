@@ -6,11 +6,10 @@
 //      Distributed under the BSD Software License (see license.txt)      //
 ////////////////////////////////////////////////////////////////////////////
 
-// wave64.c
+// riff.c
 
-// This module is a helper to the WavPack command-line programs to support Sony's
-// Wave64 WAV file varient. Note that unlike the WAV/RF64 version, this does not
-// fall back to conventional WAV in the < 4GB case.
+// This module is a helper to the WavPack command-line programs to support WAV files
+// (both MS standard and rf64 varients).
 
 #include <string.h>
 #include <stdlib.h>
@@ -23,23 +22,27 @@
 #include "utils.h"
 #include "md5.h"
 
-typedef struct {
-    char ckID [16];
-    int64_t ckSize;
-    char formType [16];
-} Wave64FileHeader;
+#pragma pack(push,4)
 
 typedef struct {
-    char ckID [16];
-    int64_t ckSize;
-} Wave64ChunkHeader;
+    char ckID [4];
+    uint64_t chunkSize64;
+} CS64Chunk;
 
-#define Wave64ChunkHeaderFormat "88D"
+typedef struct {
+    uint64_t riffSize64, dataSize64, sampleCount64;
+    uint32_t tableLength;
+} DS64Chunk;
 
-static const unsigned char riff_guid [16] = { 'r','i','f','f', 0x2e,0x91,0xcf,0x11,0xa5,0xd6,0x28,0xdb,0x04,0xc1,0x00,0x00 };
-static const unsigned char wave_guid [16] = { 'w','a','v','e', 0xf3,0xac,0xd3,0x11,0x8c,0xd1,0x00,0xc0,0x4f,0x8e,0xdb,0x8a };
-static const unsigned char  fmt_guid [16] = { 'f','m','t',' ', 0xf3,0xac,0xd3,0x11,0x8c,0xd1,0x00,0xc0,0x4f,0x8e,0xdb,0x8a };
-static const unsigned char data_guid [16] = { 'd','a','t','a', 0xf3,0xac,0xd3,0x11,0x8c,0xd1,0x00,0xc0,0x4f,0x8e,0xdb,0x8a };
+typedef struct {
+    char ckID [4];
+    uint32_t ckSize;
+    char junk [28];
+} JunkChunk;
+
+#pragma pack(pop)
+
+#define DS64ChunkFormat "DDDL"
 
 #define WAVPACK_NO_ERROR    0
 #define WAVPACK_SOFT_ERROR  1
@@ -47,79 +50,103 @@ static const unsigned char data_guid [16] = { 'd','a','t','a', 0xf3,0xac,0xd3,0x
 
 extern int debug_logging_mode;
 
-int ParseWave64HeaderConfig (FILE *infile, char *infilename, char *fourcc, WavpackContext *wpc, WavpackConfig *config)
+int ParseRiffHeaderConfig (FILE *infile, char *infilename, char *fourcc, WavpackContext *wpc, WavpackConfig *config)
 {
+    int is_rf64 = !strncmp (fourcc, "RF64", 4), got_ds64 = 0;
     int64_t total_samples = 0, infilesize;
-    Wave64ChunkHeader chunk_header;
-    Wave64FileHeader filehdr;
+    RiffChunkHeader riff_chunk_header;
+    ChunkHeader chunk_header;
     WaveHeader WaveHeader;
-    int format_chunk = 0;
+    DS64Chunk ds64_chunk;
     uint32_t bcount;
 
+    CLEAR (WaveHeader);
+    CLEAR (ds64_chunk);
     infilesize = DoGetFileSize (infile);
-    memcpy (&filehdr, fourcc, 4);
 
-    if (!DoReadFile (infile, ((char *) &filehdr) + 4, sizeof (Wave64FileHeader) - 4, &bcount) ||
-        bcount != sizeof (Wave64FileHeader) - 4 || memcmp (filehdr.ckID, riff_guid, sizeof (riff_guid)) ||
-        memcmp (filehdr.formType, wave_guid, sizeof (wave_guid))) {
-            error_line ("%s is not a valid .W64 file!", infilename);
+    if (!is_rf64 && infilesize >= 4294967296LL && !(config->qmode & QMODE_IGNORE_LENGTH)) {
+        error_line ("can't handle .WAV files larger than 4 GB (non-standard)!");
+        return WAVPACK_SOFT_ERROR;
+    }
+
+    memcpy (&riff_chunk_header, fourcc, 4);
+
+    if ((!DoReadFile (infile, ((char *) &riff_chunk_header) + 4, sizeof (RiffChunkHeader) - 4, &bcount) ||
+        bcount != sizeof (RiffChunkHeader) - 4 || strncmp (riff_chunk_header.formType, "WAVE", 4))) {
+            error_line ("%s is not a valid .WAV file!", infilename);
             return WAVPACK_SOFT_ERROR;
     }
     else if (!(config->qmode & QMODE_NO_STORE_WRAPPER) &&
-        !WavpackAddWrapper (wpc, &filehdr, sizeof (filehdr))) {
+        !WavpackAddWrapper (wpc, &riff_chunk_header, sizeof (RiffChunkHeader))) {
             error_line ("%s", WavpackGetErrorMessage (wpc));
             return WAVPACK_SOFT_ERROR;
     }
 
-#if 1   // this might be a little too picky...
-    WavpackLittleEndianToNative (&filehdr, Wave64ChunkHeaderFormat);
-
-    if (infilesize && !(config->qmode & QMODE_IGNORE_LENGTH) &&
-        filehdr.ckSize && filehdr.ckSize + 1 && filehdr.ckSize != infilesize) {
-            error_line ("%s is not a valid .W64 file!", infilename);
-            return WAVPACK_SOFT_ERROR;
-    }
-#endif
-
-    // loop through all elements of the wave64 header
+    // loop through all elements of the RIFF wav header
     // (until the data chuck) and copy them to the output file
 
     while (1) {
-        if (!DoReadFile (infile, &chunk_header, sizeof (Wave64ChunkHeader), &bcount) ||
-            bcount != sizeof (Wave64ChunkHeader)) {
-                error_line ("%s is not a valid .W64 file!", infilename);
+        if (!DoReadFile (infile, &chunk_header, sizeof (ChunkHeader), &bcount) ||
+            bcount != sizeof (ChunkHeader)) {
+                error_line ("%s is not a valid .WAV file!", infilename);
                 return WAVPACK_SOFT_ERROR;
         }
         else if (!(config->qmode & QMODE_NO_STORE_WRAPPER) &&
-            !WavpackAddWrapper (wpc, &chunk_header, sizeof (Wave64ChunkHeader))) {
+            !WavpackAddWrapper (wpc, &chunk_header, sizeof (ChunkHeader))) {
                 error_line ("%s", WavpackGetErrorMessage (wpc));
                 return WAVPACK_SOFT_ERROR;
         }
 
-        WavpackLittleEndianToNative (&chunk_header, Wave64ChunkHeaderFormat);
-        chunk_header.ckSize -= sizeof (chunk_header);
+        WavpackLittleEndianToNative (&chunk_header, ChunkHeaderFormat);
 
-        // if it's the format chunk, we want to get some info out of there and
-        // make sure it's a .wav file we can handle
-
-        if (!memcmp (chunk_header.ckID, fmt_guid, sizeof (fmt_guid))) {
-            int supported = TRUE, format;
-
-            if (format_chunk++) {
-                error_line ("%s is not a valid .W64 file!", infilename);
-                return WAVPACK_SOFT_ERROR;
-            }
-
-            chunk_header.ckSize = (chunk_header.ckSize + 7) & ~7L;
-
-            if (chunk_header.ckSize < 16 || chunk_header.ckSize > sizeof (WaveHeader) ||
-                !DoReadFile (infile, &WaveHeader, (uint32_t) chunk_header.ckSize, &bcount) ||
+        if (!strncmp (chunk_header.ckID, "ds64", 4)) {
+            if (chunk_header.ckSize < sizeof (DS64Chunk) ||
+                !DoReadFile (infile, &ds64_chunk, chunk_header.ckSize, &bcount) ||
                 bcount != chunk_header.ckSize) {
-                    error_line ("%s is not a valid .W64 file!", infilename);
+                    error_line ("%s is not a valid .WAV file!", infilename);
                     return WAVPACK_SOFT_ERROR;
             }
             else if (!(config->qmode & QMODE_NO_STORE_WRAPPER) &&
-                !WavpackAddWrapper (wpc, &WaveHeader, (uint32_t) chunk_header.ckSize)) {
+                !WavpackAddWrapper (wpc, &ds64_chunk, chunk_header.ckSize)) {
+                    error_line ("%s", WavpackGetErrorMessage (wpc));
+                    return WAVPACK_SOFT_ERROR;
+            }
+
+            got_ds64 = 1;
+            WavpackLittleEndianToNative (&ds64_chunk, DS64ChunkFormat);
+
+            if (debug_logging_mode)
+                error_line ("DS64: riffSize = %lld, dataSize = %lld, sampleCount = %lld, table_length = %d",
+                    (long long) ds64_chunk.riffSize64, (long long) ds64_chunk.dataSize64,
+                    (long long) ds64_chunk.sampleCount64, ds64_chunk.tableLength);
+
+            if (ds64_chunk.tableLength * sizeof (CS64Chunk) != chunk_header.ckSize - sizeof (DS64Chunk)) {
+                error_line ("%s is not a valid .WAV file!", infilename);
+                return WAVPACK_SOFT_ERROR;
+            }
+
+            while (ds64_chunk.tableLength--) {
+                CS64Chunk cs64_chunk;
+                if (!DoReadFile (infile, &cs64_chunk, sizeof (CS64Chunk), &bcount) ||
+                    bcount != sizeof (CS64Chunk) ||
+                    (!(config->qmode & QMODE_NO_STORE_WRAPPER) &&
+                    !WavpackAddWrapper (wpc, &cs64_chunk, sizeof (CS64Chunk)))) {
+                        error_line ("%s", WavpackGetErrorMessage (wpc));
+                        return WAVPACK_SOFT_ERROR;
+                }
+            }
+        }
+        else if (!strncmp (chunk_header.ckID, "fmt ", 4)) {     // if it's the format chunk, we want to get some info out of there and
+            int supported = TRUE, format;                        // make sure it's a .wav file we can handle
+
+            if (chunk_header.ckSize < 16 || chunk_header.ckSize > sizeof (WaveHeader) ||
+                !DoReadFile (infile, &WaveHeader, chunk_header.ckSize, &bcount) ||
+                bcount != chunk_header.ckSize) {
+                    error_line ("%s is not a valid .WAV file!", infilename);
+                    return WAVPACK_SOFT_ERROR;
+            }
+            else if (!(config->qmode & QMODE_NO_STORE_WRAPPER) &&
+                !WavpackAddWrapper (wpc, &WaveHeader, chunk_header.ckSize)) {
                     error_line ("%s", WavpackGetErrorMessage (wpc));
                     return WAVPACK_SOFT_ERROR;
             }
@@ -167,7 +194,7 @@ int ParseWave64HeaderConfig (FILE *infile, char *infilename, char *fourcc, Wavpa
                 supported = FALSE;
 
             if (!supported) {
-                error_line ("%s is an unsupported .W64 format!", infilename);
+                error_line ("%s is an unsupported .WAV format!", infilename);
                 return WAVPACK_SOFT_ERROR;
             }
 
@@ -182,7 +209,7 @@ int ParseWave64HeaderConfig (FILE *infile, char *infilename, char *fourcc, Wavpa
                 }
             }
             else if (WaveHeader.ChannelMask && (config->channel_mask || (config->qmode & QMODE_CHANS_UNASSIGNED))) {
-                error_line ("this W64 file already has channel order information!");
+                error_line ("this WAV file already has channel order information!");
                 return WAVPACK_SOFT_ERROR;
             }
             else
@@ -201,36 +228,46 @@ int ParseWave64HeaderConfig (FILE *infile, char *infilename, char *fourcc, Wavpa
             if (debug_logging_mode) {
                 if (config->float_norm_exp == 127)
                     error_line ("data format: normalized 32-bit floating point");
+                else if (config->float_norm_exp)
+                    error_line ("data format: 32-bit floating point (Audition %d:%d float type 1)",
+                        config->float_norm_exp - 126, 150 - config->float_norm_exp);
                 else
                     error_line ("data format: %d-bit integers stored in %d byte(s)",
                         config->bits_per_sample, WaveHeader.BlockAlign / WaveHeader.NumChannels);
             }
         }
-        else if (!memcmp (chunk_header.ckID, data_guid, sizeof (data_guid))) { // on the data chunk, get size and exit loop
+        else if (!strncmp (chunk_header.ckID, "data", 4)) {             // on the data chunk, get size and exit loop
 
-            if (!WaveHeader.NumChannels) {          // make sure we saw "fmt" chunk
-                error_line ("%s is not a valid .W64 file!", infilename);
+            int64_t data_chunk_size = (got_ds64 && chunk_header.ckSize == (uint32_t) -1) ?
+                ds64_chunk.dataSize64 : chunk_header.ckSize;
+
+
+            if (!WaveHeader.NumChannels || (is_rf64 && !got_ds64)) {   // make sure we saw "fmt" and "ds64" chunks (if required)
+                error_line ("%s is not a valid .WAV file!", infilename);
                 return WAVPACK_SOFT_ERROR;
             }
 
-            if ((config->qmode & QMODE_IGNORE_LENGTH) || chunk_header.ckSize <= 0) {
-                config->qmode |= QMODE_IGNORE_LENGTH;
+            if (infilesize && !(config->qmode & QMODE_IGNORE_LENGTH) && infilesize - data_chunk_size > 16777216) {
+                error_line ("this .WAV file has over 16 MB of extra RIFF data, probably is corrupt!");
+                return WAVPACK_SOFT_ERROR;
+            }
 
+            if (config->qmode & QMODE_IGNORE_LENGTH) {
                 if (infilesize && DoGetFilePosition (infile) != -1LL)
                     total_samples = (infilesize - DoGetFilePosition (infile)) / WaveHeader.BlockAlign;
                 else
-                    total_samples = -1;
+                    total_samples = -1LL;
             }
             else {
-                if (infilesize && infilesize - chunk_header.ckSize > 16777216) {
-                    error_line ("this .W64 file has over 16 MB of extra RIFF data, probably is corrupt!");
+                total_samples = data_chunk_size / WaveHeader.BlockAlign;
+
+                if (got_ds64 && total_samples != ds64_chunk.sampleCount64) {
+                    error_line ("%s is not a valid .WAV file!", infilename);
                     return WAVPACK_SOFT_ERROR;
                 }
 
-                total_samples = chunk_header.ckSize / WaveHeader.BlockAlign;
-
                 if (!total_samples) {
-                    error_line ("this .W64 file has no audio samples, probably is corrupt!");
+                    error_line ("this .WAV file has no audio samples, probably is corrupt!");
                     return WAVPACK_SOFT_ERROR;
                 }
 
@@ -246,7 +283,8 @@ int ParseWave64HeaderConfig (FILE *infile, char *infilename, char *fourcc, Wavpa
             break;
         }
         else {          // just copy unknown chunks to output file
-            int bytes_to_copy = (chunk_header.ckSize + 7) & ~7L;
+
+            int bytes_to_copy = (chunk_header.ckSize + 1) & ~1L;
             char *buff = malloc (bytes_to_copy);
 
             if (debug_logging_mode)
@@ -275,14 +313,17 @@ int ParseWave64HeaderConfig (FILE *infile, char *infilename, char *fourcc, Wavpa
     return WAVPACK_NO_ERROR;
 }
 
-int WriteWave64Header (FILE *outfile, WavpackContext *wpc, uint32_t total_samples, int qmode)
+int WriteRiffHeader (FILE *outfile, WavpackContext *wpc, uint32_t total_samples, int qmode)
 {
-    Wave64ChunkHeader datahdr, fmthdr;
-    Wave64FileHeader filehdr;
+    int do_rf64 = 0, write_junk = 1;
+    ChunkHeader ds64hdr, datahdr, fmthdr;
+    RiffChunkHeader riffhdr;
+    DS64Chunk ds64_chunk;
+    JunkChunk junkchunk;
     WaveHeader wavhdr;
     uint32_t bcount;
 
-    int64_t total_data_bytes, total_file_bytes;
+    int64_t total_data_bytes, total_riff_bytes;
     int num_channels = WavpackGetNumChannels (wpc);
     int32_t channel_mask = WavpackGetChannelMask (wpc);
     int32_t sample_rate = WavpackGetSampleRate (wpc);
@@ -292,7 +333,7 @@ int WriteWave64Header (FILE *outfile, WavpackContext *wpc, uint32_t total_sample
     int wavhdrsize = 16;
 
     if (format == 3 && WavpackGetFloatNormExp (wpc) != 127) {
-        error_line ("can't create valid Wave64 header for non-normalized floating data!");
+        error_line ("can't create valid RIFF wav header for non-normalized floating data!");
         return FALSE;
     }
 
@@ -300,6 +341,16 @@ int WriteWave64Header (FILE *outfile, WavpackContext *wpc, uint32_t total_sample
         total_samples = 0x7ffff000 / (bytes_per_sample * num_channels);
 
     total_data_bytes = (int64_t) total_samples * bytes_per_sample * num_channels;
+
+    if (total_data_bytes > 0xff000000) {
+        if (debug_logging_mode)
+            error_line ("total_data_bytes = %lld, so rf64", total_data_bytes);
+        write_junk = 0;
+        do_rf64 = 1;
+    }
+    else if (debug_logging_mode)
+        error_line ("total_data_bytes = %lld, so riff", total_data_bytes);
+
     CLEAR (wavhdr);
 
     wavhdr.FormatTag = format;
@@ -325,30 +376,54 @@ int WriteWave64Header (FILE *outfile, WavpackContext *wpc, uint32_t total_sample
         wavhdr.GUID [13] = 0x71;
     }
 
-    total_file_bytes = sizeof (filehdr) + sizeof (fmthdr) + wavhdrsize + sizeof (datahdr) + total_data_bytes;
+    strncpy (riffhdr.ckID, do_rf64 ? "RF64" : "RIFF", sizeof (riffhdr.ckID));
+    strncpy (riffhdr.formType, "WAVE", sizeof (riffhdr.formType));
+    total_riff_bytes = sizeof (riffhdr) + wavhdrsize + sizeof (datahdr) + total_data_bytes;
+    if (do_rf64) total_riff_bytes += sizeof (ds64hdr) + sizeof (ds64_chunk);
+    if (write_junk) total_riff_bytes += sizeof (junkchunk);
+    strncpy (fmthdr.ckID, "fmt ", sizeof (fmthdr.ckID));
+    strncpy (datahdr.ckID, "data", sizeof (datahdr.ckID));
+    fmthdr.ckSize = wavhdrsize;
 
-    memcpy (filehdr.ckID, riff_guid, sizeof (riff_guid));
-    memcpy (filehdr.formType, wave_guid, sizeof (wave_guid));
-    filehdr.ckSize = total_file_bytes;
+    if (write_junk) {
+        CLEAR (junkchunk);
+        strncpy (junkchunk.ckID, "junk", sizeof (junkchunk.ckID));
+        junkchunk.ckSize = sizeof (junkchunk) - 8;
+        WavpackNativeToLittleEndian (&junkchunk, ChunkHeaderFormat);
+    }
 
-    memcpy (fmthdr.ckID, fmt_guid, sizeof (fmt_guid));
-    fmthdr.ckSize = sizeof (fmthdr) + wavhdrsize;
-
-    memcpy (datahdr.ckID, data_guid, sizeof (data_guid));
-    datahdr.ckSize = total_data_bytes + sizeof (datahdr);
+    if (do_rf64) {
+        strncpy (ds64hdr.ckID, "ds64", sizeof (ds64hdr.ckID));
+        ds64hdr.ckSize = sizeof (ds64_chunk);
+        CLEAR (ds64_chunk);
+        ds64_chunk.riffSize64 = total_riff_bytes;
+        ds64_chunk.dataSize64 = total_data_bytes;
+        ds64_chunk.sampleCount64 = total_samples;
+        riffhdr.ckSize = (uint32_t) -1;
+        datahdr.ckSize = (uint32_t) -1;
+        WavpackNativeToLittleEndian (&ds64hdr, ChunkHeaderFormat);
+        WavpackNativeToLittleEndian (&ds64_chunk, DS64ChunkFormat);
+    }
+    else {
+        riffhdr.ckSize = (uint32_t) total_riff_bytes;
+        datahdr.ckSize = (uint32_t) total_data_bytes;
+    }
 
     // write the RIFF chunks up to just before the data starts
 
-    WavpackNativeToLittleEndian (&filehdr, Wave64ChunkHeaderFormat);
-    WavpackNativeToLittleEndian (&fmthdr, Wave64ChunkHeaderFormat);
+    WavpackNativeToLittleEndian (&riffhdr, ChunkHeaderFormat);
+    WavpackNativeToLittleEndian (&fmthdr, ChunkHeaderFormat);
     WavpackNativeToLittleEndian (&wavhdr, WaveHeaderFormat);
-    WavpackNativeToLittleEndian (&datahdr, Wave64ChunkHeaderFormat);
+    WavpackNativeToLittleEndian (&datahdr, ChunkHeaderFormat);
 
-    if (!DoWriteFile (outfile, &filehdr, sizeof (filehdr), &bcount) || bcount != sizeof (filehdr) ||
+    if (!DoWriteFile (outfile, &riffhdr, sizeof (riffhdr), &bcount) || bcount != sizeof (riffhdr) ||
+        (do_rf64 && (!DoWriteFile (outfile, &ds64hdr, sizeof (ds64hdr), &bcount) || bcount != sizeof (ds64hdr))) ||
+        (do_rf64 && (!DoWriteFile (outfile, &ds64_chunk, sizeof (ds64_chunk), &bcount) || bcount != sizeof (ds64_chunk))) ||
+        (write_junk && (!DoWriteFile (outfile, &junkchunk, sizeof (junkchunk), &bcount) || bcount != sizeof (junkchunk))) ||
         !DoWriteFile (outfile, &fmthdr, sizeof (fmthdr), &bcount) || bcount != sizeof (fmthdr) ||
         !DoWriteFile (outfile, &wavhdr, wavhdrsize, &bcount) || bcount != wavhdrsize ||
         !DoWriteFile (outfile, &datahdr, sizeof (datahdr), &bcount) || bcount != sizeof (datahdr)) {
-            error_line ("can't write .W64 data, disk probably full!");
+            error_line ("can't write .WAV data, disk probably full!");
             return FALSE;
     }
 
