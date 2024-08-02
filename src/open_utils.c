@@ -560,7 +560,7 @@ static int read_new_config_info (WavpackContext *wpc, WavpackMetadata *wpmd)
 
     // if there's any data, the first two bytes are file_format and qmode flags
 
-    if (bytecnt) {
+    if (bytecnt >= 2) {
         wpc->file_format = *byteptr++;
         wpc->config.qmode = (wpc->config.qmode & ~0xff) | *byteptr++;
         bytecnt -= 2;
@@ -593,6 +593,10 @@ static int read_new_config_info (WavpackContext *wpc, WavpackMetadata *wpmd)
                         for (i = 0; i < nchans; ++i)
                             if (bytecnt) {
                                 wpc->channel_reordering [i] = *byteptr++;
+
+                                if (wpc->channel_reordering [i] >= nchans)  // make sure index is in range
+                                    wpc->channel_reordering [i] = 0;
+
                                 bytecnt--;
                             }
                             else
@@ -1254,13 +1258,13 @@ int WavpackVerifySingleBlock (unsigned char *buffer, int verify_checksum)
 #endif
 
             if (meta_bc == 4) {
-                if (*dp++ != (csum & 0xff) || *dp++ != ((csum >> 8) & 0xff) || *dp++ != ((csum >> 16) & 0xff) || *dp++ != ((csum >> 24) & 0xff))
+                if (*dp != (csum & 0xff) || dp[1] != ((csum >> 8) & 0xff) || dp[2] != ((csum >> 16) & 0xff) || dp[3] != ((csum >> 24) & 0xff))
                     return FALSE;
             }
             else {
                 csum ^= csum >> 16;
 
-                if (*dp++ != (csum & 0xff) || *dp++ != ((csum >> 8) & 0xff))
+                if (*dp != (csum & 0xff) || dp[1] != ((csum >> 8) & 0xff))
                     return FALSE;
             }
 
