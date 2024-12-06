@@ -55,7 +55,6 @@ int ParseWave64HeaderConfig (FILE *infile, char *infilename, char *fourcc, Wavpa
     WaveHeader WaveHeader;
     uint32_t bcount;
 
-    CLEAR (WaveHeader);
     infilesize = DoGetFileSize (infile);
     memcpy (&filehdr, fourcc, 4);
 
